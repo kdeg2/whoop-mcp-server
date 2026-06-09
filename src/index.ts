@@ -3,6 +3,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { CallToolRequestSchema, ListToolsRequestSchema, ErrorCode, McpError } from '@modelcontextprotocol/sdk/types.js';
 import express, { type Request, type Response } from 'express';
+import { createHash } from 'node:crypto';
 import { WhoopClient } from './whoop-client.js';
 import { WhoopDatabase } from './database.js';
 import { WhoopSync } from './sync.js';
@@ -50,6 +51,22 @@ function cleanupStaleSessions(): void {
 }
 
 setInterval(cleanupStaleSessions, 5 * 60 * 1000);
+
+// ── OAuth facade state (for Claude.ai connector auth) ──
+const WHOOP_SCOPES = ['read:profile', 'read:body_measurement', 'read:cycles', 'read:recovery', 'read:sleep', 'read:workout', 'offline'];
+const pendingAuths = new Map<string, { clientState: string; clientRedirectUri: string; codeChallenge: string | null }>();
+const issuedCodes = new Map<string, { codeChallenge: string | null; issuedAt: number }>();
+const issuedTokens = new Set<string>();
+
+function baseUrl(req: Request): string {
+	const proto = (req.headers['x-forwarded-proto'] as string) ?? req.protocol;
+	return `${proto}://${req.get('host')}`;
+}
+
+function verifyPkce(verifier: string, challenge: string): boolean {
+	const hashed = createHash('sha256').update(verifier).digest('base64url');
+	return hashed === challenge;
+}
 
 function formatDuration(millis: number | null): string {
 	if (!millis) return 'N/A';
@@ -343,8 +360,107 @@ async function main(): Promise<void> {
 		const app = express();
 		app.use(express.json());
 
+		app.use(express.urlencoded({ extended: true }));
+
+		// ── OAuth 2.1 facade for Claude.ai custom connectors ──
+		// Discovery metadata (with and without path suffix per RFC 9728)
+		const metadataHandler = (req: Request, res: Response): void => {
+			const base = baseUrl(req);
+			res.json({
+				issuer: base,
+				authorization_endpoint: `${base}/authorize`,
+				token_endpoint: `${base}/token`,
+				registration_endpoint: `${base}/register`,
+				response_types_supported: ['code'],
+				grant_types_supported: ['authorization_code', 'refresh_token'],
+				code_challenge_methods_supported: ['S256'],
+				token_endpoint_auth_methods_supported: ['none', 'client_secret_post'],
+				scopes_supported: ['whoop'],
+			});
+		};
+		app.get(['/.well-known/oauth-authorization-server', '/.well-known/oauth-authorization-server/mcp'], metadataHandler);
+		app.get(['/.well-known/oauth-protected-resource', '/.well-known/oauth-protected-resource/mcp'], (req: Request, res: Response) => {
+			const base = baseUrl(req);
+			res.json({ resource: base, authorization_servers: [base] });
+		});
+
+		// Dynamic Client Registration — accept any client
+		app.post('/register', (req: Request, res: Response) => {
+			const redirectUris = (req.body?.redirect_uris as string[] | undefined) ?? [];
+			res.status(201).json({
+				client_id: 'whoop-mcp-connector',
+				client_id_issued_at: Math.floor(Date.now() / 1000),
+				redirect_uris: redirectUris,
+				token_endpoint_auth_method: 'none',
+				grant_types: ['authorization_code', 'refresh_token'],
+				response_types: ['code'],
+			});
+		});
+
+		// Authorization endpoint — proxy to Whoop's real login page
+		app.get('/authorize', (req: Request, res: Response) => {
+			const clientState = req.query.state as string | undefined;
+			const clientRedirectUri = req.query.redirect_uri as string | undefined;
+			const codeChallenge = (req.query.code_challenge as string | undefined) ?? null;
+
+			if (!clientState || !clientRedirectUri) {
+				res.status(400).send('Missing state or redirect_uri');
+				return;
+			}
+
+			const proxyState = crypto.randomUUID();
+			pendingAuths.set(proxyState, { clientState, clientRedirectUri, codeChallenge });
+
+			const params = new URLSearchParams({
+				client_id: config.clientId,
+				redirect_uri: config.redirectUri,
+				response_type: 'code',
+				scope: WHOOP_SCOPES.join(' '),
+				state: proxyState,
+			});
+			res.redirect(`https://api.prod.whoop.com/oauth/oauth2/auth?${params}`);
+		});
+
+		// Token endpoint — Claude exchanges our code / refreshes here
+		app.post('/token', (req: Request, res: Response) => {
+			const grantType = req.body?.grant_type as string | undefined;
+
+			if (grantType === 'authorization_code') {
+				const code = req.body?.code as string | undefined;
+				const verifier = req.body?.code_verifier as string | undefined;
+				const issued = code ? issuedCodes.get(code) : undefined;
+
+				if (!code || !issued) {
+					res.status(400).json({ error: 'invalid_grant' });
+					return;
+				}
+				if (issued.codeChallenge && (!verifier || !verifyPkce(verifier, issued.codeChallenge))) {
+					res.status(400).json({ error: 'invalid_grant', error_description: 'PKCE verification failed' });
+					return;
+				}
+				issuedCodes.delete(code);
+
+				const accessToken = crypto.randomUUID();
+				const refreshToken = crypto.randomUUID();
+				issuedTokens.add(accessToken);
+				issuedTokens.add(refreshToken);
+				res.json({ access_token: accessToken, token_type: 'Bearer', expires_in: 86400, refresh_token: refreshToken, scope: 'whoop' });
+				return;
+			}
+
+			if (grantType === 'refresh_token') {
+				const accessToken = crypto.randomUUID();
+				issuedTokens.add(accessToken);
+				res.json({ access_token: accessToken, token_type: 'Bearer', expires_in: 86400, refresh_token: req.body?.refresh_token ?? crypto.randomUUID(), scope: 'whoop' });
+				return;
+			}
+
+			res.status(400).json({ error: 'unsupported_grant_type' });
+		});
+
 		app.get('/callback', async (req: Request, res: Response) => {
 			const code = req.query.code as string | undefined;
+			const state = req.query.state as string | undefined;
 			if (!code) {
 				res.status(400).send('Missing authorization code');
 				return;
@@ -354,10 +470,37 @@ async function main(): Promise<void> {
 				const tokens = await client.exchangeCodeForTokens(code);
 				db.saveTokens(tokens);
 				sync.syncDays(90).catch(() => {});
+
+				// If this came from a Claude connector flow, hand Claude its own code
+				const pending = state ? pendingAuths.get(state) : undefined;
+				if (pending) {
+					pendingAuths.delete(state as string);
+					const ourCode = crypto.randomUUID();
+					issuedCodes.set(ourCode, { codeChallenge: pending.codeChallenge, issuedAt: Date.now() });
+					const redirect = new URL(pending.clientRedirectUri);
+					redirect.searchParams.set('code', ourCode);
+					redirect.searchParams.set('state', pending.clientState);
+					res.redirect(redirect.toString());
+					return;
+				}
+
 				res.send('Authorization successful! You can close this window.');
 			} catch {
 				res.status(500).send('Authorization failed. Please try again.');
 			}
+		});
+
+		// Root + HEAD support for protocol discovery
+		app.get('/', (_req: Request, res: Response) => {
+			res.json({ name: 'whoop-mcp-server', mcp_endpoint: '/mcp', status: 'ok' });
+		});
+		app.head('/', (_req: Request, res: Response) => {
+			res.setHeader('MCP-Protocol-Version', '2025-06-18');
+			res.status(200).end();
+		});
+		app.head('/mcp', (_req: Request, res: Response) => {
+			res.setHeader('MCP-Protocol-Version', '2025-06-18');
+			res.status(200).end();
 		});
 
 		app.get('/health', (_req: Request, res: Response) => {
