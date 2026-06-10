@@ -508,6 +508,14 @@ async function main(): Promise<void> {
 		});
 
 		app.all('/mcp', async (req: Request, res: Response) => {
+			// Claude.ai's connector client sends "application/json" only on some calls;
+			// the StreamableHTTP transport requires BOTH json and event-stream in Accept
+			// or it rejects with 406. Normalize it here before the transport sees it.
+			const accept = req.headers['accept'] ?? '';
+			if (!accept.includes('text/event-stream') || !accept.includes('application/json')) {
+				req.headers['accept'] = 'application/json, text/event-stream';
+			}
+
 			const sessionId = req.headers['mcp-session-id'] as string | undefined;
 
 			if (req.method === 'DELETE' && sessionId && transports.has(sessionId)) {
